@@ -1,0 +1,17 @@
+[project]
+name = "nanochat"
+version = "0.0.1"
+description = "reimplementation of nanochat"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2.0",
+  "tiktoken>=0.7.0",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["nanochat"]
