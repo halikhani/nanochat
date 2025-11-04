@@ -273,7 +273,7 @@ class RustBPETokenizer:
         ids, mask = [], []
         def add_tokens(token_ids, mask_val):
             if isinstance(token_ids, int):
-                token_idx = [token_ids]
+                token_ids = [token_ids]
             ids.extend(token_ids)
             mask.extend([mask_val] * len(token_ids))
         
