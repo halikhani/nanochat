@@ -1,2 +1,5 @@
 nanochat/configs/
 train.py
+smoke_hf_tok.py
+out_tokenizer/
+__pycache__/

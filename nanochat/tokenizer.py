@@ -60,7 +60,7 @@ class HuggingFaceTokenizer:
         # Configure the HuggingFace Tokenizer
         tokenizer = HFTokenizer(BPE(
             byte_fallback=True, # needed, guarantees encodability for any byte.
-            unk_token=False,    # no standard <unk>; special tokens handle structure.
+            unk_token=None,    # no standard <unk>; special tokens handle structure.
             fuse_unk=False      # don’t try to fuse unknowns (keeps behavior explicit).
         ))
 
