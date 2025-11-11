@@ -214,8 +214,116 @@ class GPT(nn.Module):
 
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
-        #TODO
-        
+        """ AdamW handles embeddings/output, Muon handles interior linear weights, and the learning-rate scaling keeps behavior consistent when n_embd changes."""
+        model_dim = self.config.n_embd
+        ddp, rank, local_rank, world_size = get_dist_info()
+        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        matrix_params = list(self.transformer.h.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+
+        # Create the AdamW optimizer for the embedding and lm_head
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        if rank == 0:
+            print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        adam_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+        ]
+        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        # Create the Muon optimizer for the linear layers
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        # Combine them the two optimizers into one list
+        optimizers = [adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        return optimizers
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+        B, T = idx.size()
+
+        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, f"Rotary embeddings must be in bfloat16: {self.cos.dtype} != bfloat16"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+
+        # forward transformer trunk
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        for block in self.transformer.h:
+            x = block(x, cos_sin, kv_cache)
+        x = norm(x)
+
+        # forward the lm head for logits
+        softcap = 15
+        if targets is not None:
+            # training mode, compute and return the loss
+            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap)
+            logits = logits.float() # use tf32/fp32 for logits
+            # note 1: logits originally has shape [batch, seq_len, vocab]; .view(-1, logits.size(-1)) reshapes to [batch * seq_len, vocab] matching what F.cross_entropy expects.
+            # note 2: target has shape [batch, seq_len]; .view(-1) flattens it into [batch*seq_len].
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return loss
+        else:
+            # inference mode: compute and return the logits
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap)
+            return logits
+
+    @torch.inference_mode()
+    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+        """
+        Naive autoregressive streaming inference.
+        To make it super simple, let's assume:
+        - batch size is 1
+        - ids and the yielded tokens are simple Python lists and ints
+        """
+        assert isinstance(tokens, list)
+        device = self.get_device()
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device) # # add batch dim -> [1, len(tokens)]
+        for _ in range(max_tokens):
+            logits = self.forward(ids) # (B, T, vocab_size)
+            logits = logits[:, -1, :] # (B, vocab_size), only keeps the last timestep, the next token's distribution
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf') # v[:, [-1]] is the kth score per batch, masking out the tokens below it
+            if temperature > 0:
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                # note1: dim=-1 tells argmax to collaps the last axis (vocab_size) into a single value
+            # note2: keepdim=True keeps the singleton dimension, so the result has shape (B, 1)
+                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            ids = torch.cat([ids, next_ids], dim=-1, keepdim=True) # append the new token to the input ids
+            token = next_ids.item()
+            yield token
+
+
+
+
+
+
+
+
+
 
 
 
