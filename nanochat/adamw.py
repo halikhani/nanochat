@@ -39,4 +39,51 @@ class DistAdamW(dist.optim.Optimizer):
                 grad_slices.append(grad_slice)
 
         # Pass 2: apply AdamW on the shard and all-gather parameters 
-        
+        idx = 0
+        for group in self.param_groups:
+            # pulling hyperparams for this group
+            beta1, beta2 = group['betas'] # coefficients for the exponential moving averages (m and v).
+            eps = group['eps'] # numerical epsilon for stability in division.
+            wd = group['weight_decay'] # weight decay coefficient.
+            params = group['params'] # params is the list of torch.Tensor parameters in this group.
+            for base in range(len(params)):
+                # Wait for this param’s gradient shard
+                reduce_scatter_futures[idx].wait()
+                # Note: In Pass 1, we launched a reduce_scatter_tensor for each param and stored a Future.  
+                # Here we block until the gradient for this param is ready.
+                # After this, grad_slices[idx] is guaranteed to hold the averaged gradient slice for this param on this rank.
+                p = params[base]
+                rank_size = p.shape[0] // world_size
+                p_slice = p[rank * rank_size:(rank + 1) * rank_size] # Extract this rank’s local shard of the parameter
+                lr = group['lr'] * getattr(p, "lr_mul", 1.0) # Determine effective learning rate for this parameter
+                # Grab state and gradient slice
+                state = self.state[p]
+                g_slice = grad_slices[idx]
+                # State init (Instead of storing full-size m,v for all ranks, each rank stores only m,v for its own slice of p. That saves a ton of memory.)
+                if not state:
+                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
+                    state['exp_avg'] = torch.zeros_like(p_slice)
+                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
+                # Grab local references to moments and increment step
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                state['step'] += 1
+                t = state['step']
+                # Apply decoupled weight decay (AdamW)
+                if wd != 0:
+                    eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
+                    p_slice.mul_(1 - eff_weight_decay)
+                # update running averages
+                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                # bias corrections
+                bias1 = 1 - beta1 ** t
+                bias2 = 1 - beta2 ** t
+                # compute step
+                denom = exp_avg_sq.sqrt().add_(eps)
+                step_size = lr * (torch.sqrt(bias2) / bias1)
+                update = exp_avg.div(denom).mul_(step_size)
+                p_slice.add_(other=update, alpha=-1.0)
+                idx += 1
+                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+        torch.futures.collect_all(all_reduce_futures).wait()
