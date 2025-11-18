@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-class DistAdamW(dist.optim.Optimizer):
+class DistAdamW(torch.optim.Optimizer):
     """
     Distributed AdamW optimizer.
     In the style of ZeRO-2, i.e. sharded optimizer states and gradient reduction

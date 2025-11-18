@@ -4,3 +4,5 @@ smoke_hf_tok.py
 out_tokenizer/
 __pycache__/
 rustbpe/target/
+_ckpt_smoke_test/
+checkpoint_load_test.py

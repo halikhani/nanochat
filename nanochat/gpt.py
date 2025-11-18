@@ -149,7 +149,7 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
-        self.rotary_seq_len = config.config.sequence_len * 10 # 10X over-compute
+        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         # storeing tensors on the module without treating them as learnable params
