@@ -78,6 +78,7 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -353,3 +354,119 @@ while True:
     # -------------------------------------------------------------------------
     # 12. Single training step
     
+    # evaluate the gradient
+    # for each micro-step:
+    # - forward pass with mixed precision
+    # - grab train loss for logging
+    # - divide loss by grad_accum_steps so that sum of gradients equal gradient of original big batch
+    # .backward() accumulates gradients in params
+    # immediately load next micro-batch
+    synchronize()
+    t0 = time.time()
+    for micro_step in range(grad_accum_steps):
+        with autocast_ctx:
+            loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
+        loss.backward()
+        x, y, dataloader_state_dict = next(train_loader)
+
+    # gradient clipping
+    grad_clip_enabled = grad_clip > 0
+    if grad_clip_enabled:
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        grad_norm = grad_norm_tensor.item()
+    
+    # step the optimizers
+    # updates lr for each optimizer group according to LR schedule
+    # updates muon's momentum
+    # calls .step() on both optimizers
+    # zeros grads 
+    # measueres step wall_clock time
+    lrm = get_lr_multiplier(step)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+    muon_momentum = get_muon_momentum(step)
+    for group in muon_optimizer.param_groups:
+        group["momentum"] = muon_momentum
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    # -------------------------------------------------------------------------
+
+    # 13. Logging and metrics
+    # smooth training loss via EMA and debiases it 
+    # computes:
+    # - training progress (pct_done)
+    # - tokens per second
+    # FLOPS/s and MFU (Modeul FLOPs Utilization vvs ideal H100)
+    # ignores the first 10 steps to account for startup time
+    ema_beta = 0.9
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item()
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+    pct_done = 100 * step / num_iterations
+    tok_per_sec = int(total_batch_size / dt)
+    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    promised_flops_per_sec_h100 = 989e12 * ddp_world_size
+    mfu = 100 * flops_per_sec / promised_flops_per_sec_h100
+    if step > 10:
+        total_training_time += dt
+
+    print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    if step % 100 == 0:
+        log_data = {
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "train/loss": debiased_smooth_loss,
+            "train/lrm": lrm,
+            "train/dt": dt,
+            "train/tok_per_sec": tok_per_sec,
+            "train/mfu": mfu,
+        }
+        if grad_clip_enabled:
+            log_data["train/grad_norm"] = grad_norm
+        wandb_run.log(log_data)
+
+    # state update
+    step += 1
+
+# print a few more stats
+print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+print0(f"Total training time: {total_training_time/60:.2f}m")
+print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
+    
+# Log to report
+from nanochat.report import get_report
+get_report().log(section="Base model training", data=[
+    user_config, # CLI args
+    { # stats about the training setup
+        "Number of parameters": num_params,
+        "Number of FLOPs per token": f"{num_flops_per_token:e}",
+        "Calculated number of iterations": num_iterations,
+        "Number of training tokens": total_tokens,
+        "Tokens : Params ratio": total_batch_size * num_iterations / num_params,
+        "DDP world size": ddp_world_size,
+        "warmup_ratio": warmup_ratio,
+        "warmdown_ratio": warmdown_ratio,
+        "final_lr_frac": final_lr_frac,
+    },
+    { # stats about training outcomes
+        "Minimum validation bpb": min_val_bpb,
+        "Final validation bpb": val_bpb,
+        "CORE metric estimate": results.get("core_metric", None),
+        "MFU %": f"{mfu:.2f}%",
+        "Total training flops": f"{flops_so_far:e}",
+        "Total training time": f"{total_training_time/60:.2f}m",
+        "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+    }
+])
+
+# cleanup
+wandb_run.finish() # wandb run finish
+compute_cleanup()
