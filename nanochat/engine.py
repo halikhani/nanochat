@@ -147,5 +147,62 @@ class KVCache:
         self.pos = other.pos
 
     def insert_kv(self, layer_idx, k, v):
-        pass
+        # lazy init the cache here since we need to know the dtype and device
+        if self.kv_cache is None:
+            self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
+        
+        # insert the new k, v into the cache and return the full view so far
+        B, H, T_add, D = k.size() # k shape: (batch, num_heads, tokens_to_add, head_dim)
+        t0, t1 = self.pos, self.pos + T_add
 
+        # dynamically grow the cache if needed
+        if t1 > self.kv_cache.size(4): # fifth dim
+            t_needed = t1 + 1024
+            t_needed = (t_needed + 1023) & ~1023 # then round up to the nearest multiple of 1024
+            # other way of doing this:
+            # t_needed = (t1 + 1023) // 1024 * 1024
+            additional_shape = list(self.kv_cache.shape)
+            additional_shape[4] = t_needed - self.kv_cache.size(4)
+            additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
+            self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
+            self.kv_shape = self.kv_cache.shape
+
+        # insert the new k, v into the cache
+        self.kv_cache[layer_idx, 0, :, :, t0:t1, :] = k
+        self.kv_cache[layer_idx, 1, :, :, t0:t1, :] = v
+        # Return the full cached keys/values up to current position (as a view)
+        key_view = self.kv_cache[layer_idx, 0, :, :, :t1, :]
+        value_view = self.kv_cache[layer_idx, 1, :, :, :t1, :]
+        # update pos after last layer of the Transformer inserts
+        if layer_idx == self.kv_cache.size(0) - 1:
+            self.pos = t1
+        return key_view, value_view
+
+# -----------------------------------------------------------------------------
+
+@torch.inference_mode()
+def sample_next_token(logits, rng, temperature=1.0, top_k=None):
+    """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
+    assert temperature >= 0, "Temperature must be non-negative"
+    if temperature == 0:
+        return torch.argmax(logits, dim=-1, keepdim=True) # greedy sampling, returning the index of the highest logit
+
+    if top_k is not None:
+        k = min(top_k, logits.size(-1))
+        vals, idx = torch.topk(logits, k, dim=-1)
+        vals = vals / temperature
+        probs = F.softmax(vals, dim=-1)
+        choice = torch.multinomial(probs, num_samples=1, generator=rng)
+        # whats rng? random number generator
+
+# -----------------------------------------------------------------------------
+
+class RowState:
+    # Per-row state tracking during generation
+    def __init__(self, current_tokens=None):
+        self.current_tokens = current_tokens if current_tokens is not None else [] # current tokens in the row
+        self.forced_tokens = deque() # Queue of tokens to force inject
+        self.in_python_block = False # Whether we're inside a Python block
+        self.python_expr_toknes = [] # List of tokens that are part of the Python expression
+        self.completed = False #  Whether this row has completed generation
+        
