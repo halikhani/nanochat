@@ -94,3 +94,58 @@ def use_calculator(expr):
 
 # ------------------------------------------------------------
 
+class KVCache:
+    """
+    Works hand-in-hand with the GPT model to maintain the KV cache.
+    Note that the .pos advances automatically after the last layer of the Transformer inserts.
+    """
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
+        # each of K/V is of shape (batch_size, num_heads, seq_len, head_dim)
+        self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
+        self.kv_cache = None
+        self.pos = 0 # current position in the time in the cache
+
+    def reset(self):
+        self.pos = 0
+
+    def get_pos(self):
+        return self.pos
+
+    def prefill(self, other):
+        """
+        Prefill given another KV cache. Optionally expand along batch dim.
+        This is used when we do batch 1 prefill and then want to generate
+        multiple samples in parallel from there.
+        """
+
+        # 1) validate the shapes
+        assert self.kv_cache is None, "Cannot prefill a non-empty cache"
+        assert other.kv_cache is not None, "Cannot prefill with an empty cache"
+        
+        # extract dims explicitly
+        self_layers, self_kv, self_batch, self_heads, self_seq, self_head_dim = self.kv_shape
+        other_layers, other_kv, other_batch, other_heads, other_seq, other_head_dim = other.kv_shape
+
+        # validate dims
+        assert self_layers == other_layers, "Cannot prefill with a cache of different number of layers"
+        assert self_kv == other_kv, "Cannot prefill with a cache of different number of key/value pairs"
+        assert self_heads == other_heads, "Cannot prefill with a cache of different number of heads"
+        assert self_head_dim == other_head_dim, "Cannot prefill with a cache of different head dimension"
+
+        # batch size can be expanded, other should be 1, self can be larger
+        assert self_batch == other_batch or other_batch == 1, f"Batch size mismatch: {self_batch} vs {other_batch} (other must be 1 or equal)"
+
+        # Sequence length: self must be longer than other
+        assert self_seq >= other_seq, f"Sequence length mismatch: {self_seq} vs {other_seq} (self must be longer or equal)"
+
+        # 2) Initialize the cache
+        dtype, device = other.kv_cache.dtype, other.kv_cache.device
+        self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
+        # 3) copy the data over
+        self.kv_cache[..., :other_seq, :] = other.kv_cache
+        # 4) update the position
+        self.pos = other.pos
+
+    def insert_kv(self, layer_idx, k, v):
+        pass
+
