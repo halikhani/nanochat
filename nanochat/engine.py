@@ -206,3 +206,199 @@ class RowState:
         self.python_expr_toknes = [] # List of tokens that are part of the Python expression
         self.completed = False #  Whether this row has completed generation
         
+class Engine:
+
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer # needed for tool use
+
+    @torch.inference_mode()
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """ same as generate() in gpt.py, but does single prefill and then clones the KV cache"""
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting a list of token ids"
+        device = self.model.get_device()
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        # get the special tokens we need to coordinate the tool use state machines
+        get_special = lambda s: self.tokenizer.encode_special(s)
+        python_start, python_end = get_special("<|python_start|>"), get_special("<|python_end|>")
+        output_start, output_end = get_special("<|output_start|>"), get_special("<|output_end|>")
+        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
+        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+
+        # 1. Run a batch 1 prefill of the prompt token
+        m = self.model.config
+        kv_model_kwargs = {
+            "num_heads": m.n_kv_heads,
+            "head_dim": m.n_embd // m.n_kv_heads,
+            "num_layers": m.n_layer,
+        }
+        kv_cache_prefill = KVCache(batch_size=1, seq_len=len(tokens), **kv_model_kwargs)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        logits = logits[:, -1, :] # (B, 1, vocab_size) for the last token in the prompt, B is the batch size which is 1 in this case
+        next_ids = sample_next_token(logits, rng, temperature, top_k) # (B, 1), in which batch size is 1
+        sampled_tokens = next_ids[:, 0].tolist() # (1,)
+
+        # 2. Replicate KV cache for each sample/row
+        # why? because we want to generate multiple samples in parallel from the same prefill state
+
+        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else m.sequence_len
+        kv_cache_decode = KVCache(
+            batch_size=num_samples,
+            seq_len=kv_length_hint,
+            **kv_model_kwargs
+        )
+        kv_cache_decode.prefill(kv_cache_prefill)
+        del kv_cache_prefill # free memory
+
+        # 3. Initialize states for each sample
+        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+
+        # 4. Main generation loop
+        num_generated = 0
+        first_iteration = True
+        while True:
+            # stop condition: we've reached the max number of generated tokens
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            # stop condition: all rows have completed generation
+            if all(state.completed for state in row_states):
+                break
+
+            # get sampled tokens - either from prefill or from forward pass
+            if first_iteration:
+                sampled_tokens = [sampled_tokens[0]] * num_samples # broadcast the first token to all rows
+                # TODO: we should sample first token for each row separately
+                first_iteration = False
+            else:
+                # forwad the model and get the next token for each row
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode) # (B, T, vocab_size)
+                logits = logits[:, -1, :] # (B, 1, vocab_size) for the last token in the sequence
+                next_ids = sample_next_token(logits, rng, temperature, top_k) # (B, 1)
+                sampled_tokens = next_ids[:, 0].tolist() # (B,)
+
+            # process each row: choose the next token, update state, optional tool use
+            token_columns = [] # next token ids for each row
+            token_masks = [] # contains mask (was it sampeld (1) or forced (0)) along each row
+            for i, state in enumerate(row_states):
+                # select the next token in this row
+                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                token_masks.append(0 if is_forced else 1)
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_columns.append(next_token)
+                # Update the state of this row to include the next token
+                state.current_tokens.append(next_token)
+                # On <|assistant_end|> or <|bos|>, mark the row as completed
+                if next_token == assistant_end or next_token == bos:
+                    state.completed = True
+                # handle tool logic
+                if next_token == python_start:
+                    state.in_python_block = True
+                    state.python_expr_toknes = []
+                elif next_token == python_end and state.in_python_block:
+                    state.in_python_block = False
+                    if state.python_expr_tokens:
+                        expr = self.tokenizer.decode(state.python_expr_tokens)
+                        result = use_calculator(expr)
+                        if result is not None:
+                            result_tokens = self.tokenizer.decode(str(result))
+                            state.forced_tokens.append(output_start)
+                            state.forced_tokens.extend(result_tokens)
+                            state.forced_tokens.append(output_end)
+                    state.python_expr_tokens = []
+                elif state.in_python_block:
+                    state.python_expr_tokens.append(next_token)
+            
+            # yield the token column
+            yield token_columns, token_masks
+            # how upper line works? token_columns is a list of token ids, token_masks is a list of mask values (1 for sampled, 0 for forced)
+            # so we are yielding the token ids and the mask values for each row  
+            num_generated += 1
+            # prepare ids for next iteration
+            ids = torch.tensor(token_columns, dtype=torch.long, device=device).unsqueeze(1) # (B, 1)
+
+    def generate_batch(self, tokens, num_samples=1, **kwargs):
+        """
+        Non-streaming batch generation that just returns the final token sequences
+        Returns a list of token sequences (list of list of ints)
+        Terminal tokens are not included (e.g., <|assistant_end|> or <|bos|>)
+        """
+
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id
+        results = [tokens.copy() for _ in range(num_samples)]
+        masks = [[0] * len(tokens) for _ in range(num_samples)]
+        completed = [False] * num_samples
+        for token_column, token_mask in self.generate(tokens, num_samples, **kwargs):
+            for i, (token, mask) in enumerate(zip(token_column, token_mask)):
+                if not completed[i]:
+                    if token == assistant_end or token == bos:
+                        completed[i] = True
+                    else:
+                        results[i].append(token)
+                        masks[i].append(mask)
+            # stop of all rows are completed
+            if all(completed):
+                break
+        return results, masks
+
+if __name__ == "__main__":
+    """
+    Quick inline test to make sure that the naive/slow model.generate function
+    is equivalent to the faster Engine.generate function here.
+    """
+
+    import time
+    # init compute
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
+    device_type = autodetect_device_type()
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+
+    # load the model and the tokenizer
+    model, tokenizer, meta = load_model("base", device=device, phase="eval")
+    bos_token_id = tokenizer.get_bos_token_id()
+    # common hyperparams
+    kwargs = dict(max_tokens=64, temperature=0.0)
+    # set the starting prompt
+    prompt_tokens = tokenizer.encode("The chemical formula for water is", prepend=bos_token_id)
+    # generate the reference sequence using the model.generate function
+    generated_tokens = []
+    torch.cuda.synchronize()
+    t0 = time.time()
+    stream = model.generate(prompt_tokens, **kwargs)
+    # whats autocast_ctx? it is a context manager that allows us to use mixed precision training
+    with autocast_ctx:
+        for token in stream:
+            generated_tokens.append(token)
+            chunk = tokenizer.decode([token])
+            print(chunk, end="", flush=True)
+    print()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    print(f"Reference time: {t1 - t0:.4f} seconds")
+    reference_ids = generated_tokens
+    # generate tokens with engine
+    generated_tokens = []
+    engine = Engine(model, tokenizer)
+    stream = engine.generate(prompt_tokens, num_samples=1, **kwargs) # run in fp32
+    torch.cuda.synchronize()
+    t0 = time.time()
+    with autocast_ctx:
+        for token_column, token_mask in stream:
+            token = token_column[0] # only print out the first row
+            generated_tokens.append(token)
+            chunk = tokenizer.decode([token])
+            print(chunk, end="", flush=True)
+    print()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    print(f"Engine time: {t1 - t0:.4f} seconds")
+    engine_ids = generated_tokens
+    # compare the two sequences
+    for i in range(len(reference_ids)):
+        if reference_ids[i] != engine_ids[i]:
+            print(f"Mismatch at index {i}: {reference_ids[i]} != {engine_ids[i]}")
+            break
+    print(f"Match: {reference_ids == engine_ids}")
