@@ -289,15 +289,15 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     mean_correct = correct.mean().item()
     return mean_correct
     
-    Process 0 (rank=0): evaluates examples [0, 4, 8]
-    Process 1 (rank=1): evaluates examples [1, 5, 9]
-    Process 2 (rank=2): evaluates examples [2, 6, 10]
-    Process 3 (rank=3): evaluates examples [3, 7, 11]
+    # Process 0 (rank=0): evaluates examples [0, 4, 8]
+    # Process 1 (rank=1): evaluates examples [1, 5, 9]
+    # Process 2 (rank=2): evaluates examples [2, 6, 10]
+    # Process 3 (rank=3): evaluates examples [3, 7, 11]
 
-    After evaluation:
-    correct = [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1]  (on each process)
+    # After evaluation:
+    # correct = [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1]  (on each process)
 
-    After all_reduce (SUM):
-    correct = [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1]  (same, since each process only wrote to its own indices)
+    # After all_reduce (SUM):
+    # correct = [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1]  (same, since each process only wrote to its own indices)
 
-    mean_correct = 8/12 = 0.667 (66.7% accuracy)
+    # mean_correct = 8/12 = 0.667 (66.7% accuracy)
