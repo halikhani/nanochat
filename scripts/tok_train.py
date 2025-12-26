@@ -14,7 +14,7 @@ import torch
 
 from nanochat.tokenizer import RustBPETokenizer
 from nanochat.common import get_base_dir
-from nanochat.datasets import parquets_iter_batched
+from nanochat.dataset import parquets_iter_batched
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments

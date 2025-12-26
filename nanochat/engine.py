@@ -193,6 +193,7 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
         vals = vals / temperature
         probs = F.softmax(vals, dim=-1)
         choice = torch.multinomial(probs, num_samples=1, generator=rng)
+        return choice
         # whats rng? random number generator
 
 # -----------------------------------------------------------------------------
@@ -203,7 +204,7 @@ class RowState:
         self.current_tokens = current_tokens if current_tokens is not None else [] # current tokens in the row
         self.forced_tokens = deque() # Queue of tokens to force inject
         self.in_python_block = False # Whether we're inside a Python block
-        self.python_expr_toknes = [] # List of tokens that are part of the Python expression
+        self.python_expr_tokens = [] # List of tokens that are part of the Python expression
         self.completed = False #  Whether this row has completed generation
         
 class Engine:
@@ -327,7 +328,7 @@ class Engine:
         """
 
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        bos = self.tokenizer.get_bos_token_id
+        bos = self.tokenizer.get_bos_token_id()
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples

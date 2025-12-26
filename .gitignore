@@ -6,3 +6,4 @@ __pycache__/
 rustbpe/target/
 _ckpt_smoke_test/
 checkpoint_load_test.py
+IMPLEMENTATION_STATUS.md

@@ -211,6 +211,7 @@ class GPT(nn.Module):
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        return num_flops_per_token
 
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
