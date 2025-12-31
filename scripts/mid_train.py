@@ -115,4 +115,219 @@ val_dataset = TaskMixture([
 last_step = False # we will toggle this to True when we reach the end of the training dataset
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 def mid_data_generator(split):
-    pass
+    global last_step, approx_progress
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+    dataset = train_datset if split == "train" else val_dataset
+    dataset_size = len(dataset)
+    assert dataset_size > 0
+    needed_tokens = device_batch_size * max_seq_len + 1 # to form 1 training batch of inputs and targets
+    token_buffer = deque()
+    # CUDA support memory pinning for faster transfers between CPU and GPU:
+    scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=(device_type == "cuda"))
+    cursor = ddp_rank # increment by ddp_world_size each time to process unique docs by each rank
+    it = 0 # iteration counter
+    while True:
+        # accumulate enough tokens for one iteration before yielding
+        while len(token_buffer) < needed_tokens:
+            conversation = dataset[cursor]
+            ids, _ = tokenizer.render_conversation(conversation)
+            token_buffer.extend(ids)
+            cursor += ddp_world_size
+            if cursor >= dataset_size:
+                cursor -= dataset_size # wrap around for another epoch
+                if split == "train":
+                    last_step = True # to terminate the training loop
+        # stopping condition to respect num_iterations if given
+        it += 1
+        if 0 < num_iterations <= it and split == "train":
+            last_step = True 
+        # build up inputs and targets and yield
+        for i in range(needed_tokens):
+            scratch[i] = token_buffer.popleft()
+        inputs_cpu = scratch[:-1].to(dtype=torch.int32)
+        targets_cpu = scratch[1:]
+        inputs = inputs_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int32, non_blocking=True)
+        targets = targets_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int64, non_blocking=True)
+        # explain last 2 lines: non_blocking=True is a hint to the PyTorch runtime to allow asynchronous transfers
+        if split == "train":
+            if num_iterations > 0:
+                approx_progress = it / num_iterations # progress as a fraction of the total number of iterations
+            else:
+                approx_progress = cursor / dataset_size # progress as a fraction of the total number of documents
+        yield inputs, targets
+        # what yield does here? 
+        # the caller can then use the inputs and targets to train the model
+        # the function will resume from where it left off when the caller asks for the next batch
+        # this is a way to implement a data generator that can be used to train the model
+
+train_loader = mid_data_generator("train")
+build_val_loader = lambda: mid_data_generator("val")
+progress = 0 # will go to 1 over the course of the epoch
+
+# learning rate scheduler
+def get_lr_multiplier(progress):
+    # first 80% of training: no decay, then linearly ramp down to 0
+    return 1 if progress < 0.8 else 1 - (progress - 0.8) / 0.2
+
+# momentum scheduler for moun optimizer
+def get_moun_momentum(it):
+    frac = min(it / 300, 1)
+    momentum = (1 - frac) * 0.85 + frac * 0.95
+    return momentum
+
+# --------------------------------------------------------------
+# training loop
+
+x, y = next(train_loader) # prefetch first batch of data
+min_val_bpb = float('inf') # best validation bpb seen so far
+smooth_train_loss = 0 # EMA of training loss (EMA: Exponential Moving Average)
+ema_beta = 0.9
+total_training_time = 0 # total wall clock time of training
+step = 0
+while True:
+    flops_so_far = num_flops_per_token * total_batch_size * step
+
+    # synchronize last step across all ranks to avoid hangs in the dist setting
+    # what is hang? it is when the training loop is stuck and the program is not able to progress
+    # why that happens? because the training loop is waiting for all ranks to reach the same step
+
+    if ddp:
+        last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
+        dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
+        # Converts the boolean last_step to a tensor on the device.
+        # dist.all_reduce(..., op=dist.ReduceOp.MAX):
+        # Collects the value from all ranks.
+        # Applies MAX (so if any rank has True/1, the result is True/1).
+        # Broadcasts the result back to all ranks.
+        # Converts the result back to a boolean.
+        last_step = bool(last_step_tensor.item())
+    
+    # once in a while evaluate the val bpb (with all ranks)
+    if eval_every > 0 and (last_step or step % eval_every == 0):
+        model.eval()
+        val_loader = build_val_loader()
+        eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+        with autocast_ctx:
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        if val_bpb < min_val_bpb:
+            min_val_bpb = val_bpb
+        wandb_run.log({
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "val/bpb": val_bpb,
+        })
+        model.train() # TODO: why this line here?
+    
+    # save checkpoints at the end of the run (only for master rank)
+    if master_process and last_step and not dry_run:
+        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+        checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(),
+            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+            {
+                "step": step,
+                "val_bpb": val_bpb, # loss at last step
+                "model_config": {
+                    "sequence_len": max_seq_len,
+                    "vocab_size": tokenizer.get_vocab_size(),
+                    "n_layer": depth,
+                    "n_head": model.config.n_head,
+                    "n_kv_head": model.config.n_kv_head,
+                    "n_embd": model.config.n_embd,
+                },
+                "user_config": user_config, # inputs to the training script
+            }
+        )
+    if last_step:
+        break
+
+    # --------------------------------------------------------------
+    # single training step
+    # evaluate the gradient
+
+    # Training step flow:
+    # Forward: compute loss.
+    # Backward: compute gradients.
+    # Accumulate: repeat for multiple micro-batches.
+    # Update: optimizer applies accumulated gradients.
+    # Reset: clear gradients for the next step.
+
+    synchronize()
+    t0 = time.time()
+    for micro_step in range(grad_accum_steps):
+        with autocast_ctx:
+            loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps # each .backward*=() is a grad sum -> normalize
+        loss.backward() # Backward pass: computes gradients via autograd, Computes gradients via the chain rule.
+        x, y = next(train_loader) # prefetch next batch while GPU is busy with forward/backward pass
+        progress = max(progress, approx_progress) 
+    # step the optimizer
+    lrm = get_lr_multiplier(progress)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+    muon_momentum = get_moun_momentum(step)
+    for group in muon_optimizer.param_groups:
+        group["momentum"] = muon_momentum
+    # Updates model parameters using accumulated gradients.
+    # AdamW: uses adaptive learning rates and momentum.
+    # Muon: uses momentum-based updates.
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    # -------------------------------------------------------------------------
+
+    # state
+    step += 1
+
+    # logging
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item()
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    pct_done = 100 * progress
+    tok_per_sec = int(total_batch_size / dt)
+    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
+    mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    if step % 10 == 0:
+        wandb_run.log({
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "train/loss": debiased_smooth_loss,
+            "train/lrm": lrm,
+            "train/dt": dt,
+            "train/tok_per_sec": tok_per_sec,
+            "train/mfu": mfu,
+        })
+
+# print a few more stats
+print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+print0(f"Total training time: {total_training_time/60:.2f}m")
+print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
+# Log to report
+if not dry_run:
+    from nanochat.report import get_report
+    get_report().log(section="Midtraining", data=[
+        user_config, # CLI args
+        { # stats about the training setup
+            "Number of iterations": step,
+            "DDP world size": ddp_world_size,
+        },
+        { # stats about training outcomes
+            "Minimum validation bpb": min_val_bpb,
+        }
+    ])
+
+# cleanup
+wandb_run.finish() # wandb run finish
+compute_cleanup()
