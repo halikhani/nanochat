@@ -42,7 +42,8 @@ device_batch_size = 4 # max to avoid OOM
 # optimization
 num_epochs = 1
 num_iterations = -1 # override number of iterations (-1 = disable, use num_epochs to derive it)
-target_examples_per_step = 32
+target_examples_per_step = 32 # Desired effective batch size per optimizer update. 
+# (The batch size that affects training dynamics and learning rate scaling)
 unembedding_lr = 0.004
 embedding_lr = 0.2
 matrix_lr = 0.02
@@ -130,5 +131,181 @@ def sft_data_generator(dataset, batch_size):
                 yield collate_and_yield(batch)
                 batch = []
 
+examples_per_step = device_batch_size * ddp_world_size # Actual examples processed in one forward pass across all GPUs, without gradient accumulation
+print0(f"Target examples per step: {target_examples_per_step}")
+print0(f"Device batch size: {device_batch_size}")
+print0(f"Examples per step is device_batch_size * ddp_world_size: {examples_per_step}")
+assert target_examples_per_step % examples_per_step == 0, "Target examples per step must be divisible by examples per step"
+grad_accum_steps = target_examples_per_step // examples_per_step
+print0(f"Gradient accumulation steps: {grad_accum_steps}")
+# what is grad_accum_steps? it is the number of steps to accumulate the gradients before updating the model parameters
 
-        
+if num_iterations == -1:
+    # derive it from num_epochs and size of the dataset
+    assert num_epochs > 0, "Number of epochs must be greater than 0 if num_iterations is disabled"
+    # Example: 23K examples, 32 examples/step, 1 epoch → num_iterations = 718.
+    num_iterations = (len(train_ds) // target_examples_per_step) * num_epochs
+train_loader = sft_data_generator(train_ds, batch_size=device_batch_size)
+build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_size)
+
+# Example with 8 GPUs
+# device_batch_size = 4 → each GPU processes 4 examples
+# ddp_world_size = 8 → examples_per_step = 4 × 8 = 32
+# target_examples_per_step = 32 → matches, so grad_accum_steps = 1
+# Effective batch size per update = 32
+# In summary: examples_per_step is what you get per forward pass; 
+# target_examples_per_step is what you want for each optimizer update. Gradient accumulation makes them equal when needed.
+
+
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer
+optimizers = model.setup_optimizers(
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
+    weight_decay=weight_decay,
+)
+# Set the initial learning rate as a fraction of the base learning rate
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["lr"] = group["lr"] * init_lr_frac
+        group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
+
+# -----------------------------------------------------------------------------
+# Training loop
+
+# learning rate schedule
+def get_lr_multiplier(it):
+    lrm = 1.0 - it / num_iterations
+    return lrm
+
+# starting the training loop
+step = 0
+for step in range(num_iterations):
+    last_step = (step == num_iterations - 1)
+    # evaluate the validation loss
+    if last_step or step * eval_every == 0:
+        model.eval()
+        val_loader = build_val_loader()
+        losses = []
+        for _ in range(eval_steps):
+            val_inputs, val_targets = next(val_loader)
+            with torch.no_grad(), autocast_ctx:
+                loss = model(val_inputs, val_targets)
+            losses.append(loss)
+        val_loss = torch.stack(losses).mean() # average over eval_steps
+        if ddp:
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over the ranks
+        val_loss = val_loss.item()
+        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
+        # NOTE: shouldn't we log this on the master process only?
+        wandb_run.log({
+            "step": step,
+            "val_loss": val_loss,
+            })
+        # revert back to train mode
+        model.train()
+
+    # evaluate accuracy of the multiple choice tasks (quick to run)
+    if last_step or step % eval_metrics_every == 0:
+        model.eval()
+        metrics = {}
+        with torch.no_grad(), autocast_ctx:
+            # note that because these are inside no_grad, we can usually afford to at least ~2X the batch size
+            metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
+            metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
+        metrics_str = ', '.join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        print0(f"Step {step:05d} | {metrics_str}")
+        # NOTE: shouldn't we log this on the master process only?
+        wandb_run.log({
+            "step": step,
+            **metrics,
+        })
+        model.train()
+    
+    if last_step:
+        break
+
+    # evaluate the gradient
+    # Each iteration:
+    # - Fetches a mini-batch
+    # - Computes loss
+    # - Normalizes loss (divide by grad_accum_steps)
+    # - Accumulates gradients via .backward()
+    # - Tracks active tokens
+    num_tokens = torch.tensor(0, device=device) # number of 'active' tokens of supervision seen so far
+    for micro_step in range(grad_accum_steps):
+        train_inputs, train_targets = next(train_loader)
+        with autocast_ctx:
+            loss = model(train_inputs, train_targets)
+        train_loss = loss.detach() # why detach? for logging only, not needed for gradient computation
+        # Only the last micro-step's loss is kept (overwrites previous ones).
+        loss = loss / grad_accum_steps # each .backward() is a grad sum -> normalize here
+        # Only the last micro-step's loss is kept (overwrites previous ones).
+        loss.backward() # Computes gradients and accumulates them in parameter .grad
+        # Does not zero gradients between micro-steps, so gradients accumulate.
+        num_tokens += (train_targets >= 0).sum()
+    if ddp:
+        dist.all_reduce(train_loss, op=dist.ReduceOp.SUM) # sum over the ranks # NOTE: why sum and not average
+
+    # learning rate scheduler
+    lrm = get_lr_multiplier(step)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+
+    # step the optimizers
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    # Prevent unwanted accumulation: Without zeroing, the next iteration's gradients would add to the old ones, causing incorrect updates.
+    # Each training iteration should start with zero gradients and accumulate only for that iteration's batch(es).
+
+    # logging
+    train_loss_item = train_loss.item()
+    num_tokens_item = num_tokens.item()
+    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
+    wandb_run.log({
+        "step": step,
+        "lrm": lrm,
+        "train_loss": train_loss_item,
+        "num_tokens": num_tokens_item,
+    })
+    step += 1
+
+# save the model at the end of the run
+if master_process:
+    base_dir = get_base_dir()
+    depth = model.config.n_layer
+    output_dirname = model_tag if model_tag else f"d{depth}"
+    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+    save_checkpoint(
+        checkpoint_dir,
+        step,
+        model.state_dict(),
+        None, # note: we don't bother to save the optimizer state
+        {
+            "step": step,
+            "val_loss": val_loss,
+            **metrics,
+            "model_config": model_config_kwargs,
+        }
+    )
+    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+
+# log to report
+from nanochat.report import get_report
+get_report().log(section="Chat SFT", data=[
+    user_config, # CLI args
+    {
+        "Training rows": len(train_ds),
+        "Number of iterations": num_iterations,
+        "Training loss": train_loss_item,
+        "Validation loss": val_loss,
+    },
+])
+
+# Cleanup
+wandb_run.finish()
+compute_cleanup()
