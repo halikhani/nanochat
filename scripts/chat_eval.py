@@ -16,7 +16,7 @@ from hamidra.KVC.tutorials.nanochat.nanochat.dataset import num
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, get_dist_infor, print0, autodetect_device_type
+from nanochat.common import compute_init, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 

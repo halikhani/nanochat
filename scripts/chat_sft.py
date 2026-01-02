@@ -246,7 +246,7 @@ for step in range(num_iterations):
         # Does not zero gradients between micro-steps, so gradients accumulate.
         num_tokens += (train_targets >= 0).sum()
     if ddp:
-        dist.all_reduce(train_loss, op=dist.ReduceOp.SUM) # sum over the ranks # NOTE: why sum and not average
+        dist.all_reduce(num_tokens, op=dist.ReduceOp.SUM) # sum over the ranks 
 
     # learning rate scheduler
     lrm = get_lr_multiplier(step)
