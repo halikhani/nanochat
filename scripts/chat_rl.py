@@ -147,7 +147,61 @@ def get_batch():
 # -----------------------------------------------------------------------------
 # Simple evaluation loop for GSM8K pass@k
 def run_gsm8k_eval(task, tokenizer, engine, max_examples=None, num_samples=1, max_completion_tokens=256, temperature=1.0, top_k=50):
-    pass
+    """
+    Evaluates GSM8K task and returns a list of records of evaluation outcomes.
+    In a distributed setting, all ranks cooperate but this function will NOT
+    do the reduction across ranks. This is the responsibility of the caller.
+    Because the evaluation can take a while, this function will yield records one by one.
+    
+    This pattern is useful for long-running evaluations where you want to process results 
+    incrementally rather than waiting for everything to finish.
+    """
+
+    # max_examples is the maximum number of examples to evaluate, or the total number of examples if not specified
+    # num_samples is the number of samples to generate for each example
+
+    max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
+    for idx in range(ddp_rank, max_examples, ddp_world_size):
+        conversation = task[idx]
+        tokens = tokenizer.render_for_completion(conversation)
+        prefix_length = len(tokens)
+        # generate k samples using batched generation inside the engine
+        assert num_samples <= device_batch_size, # usually this is true. we can add a loop if not to avoid OOM
+        generated_tokens_sequences, masks = engine.generate_batch(
+            tokens,
+            num_samples=num_samples,
+            max_tokens=max_completion_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        # check each sample for correctness
+        outcomes = []
+        for sample_tokens in generated_tokens_sequences:
+            generated_tokens = sample_tokens[prefix_length:]
+            generated_text = tokenizer.decode(generated_tokens)
+            is_correct = task.evaluate(conversation, generated_text)
+            outcomes.append({
+                "is_correct": is_correct,
+            })
+        record = {
+            "idx": idx,
+            "outcomes": outcomes,
+        }
+        yield record
+        # Each iteration of the loop:
+        # Processes one example (distributed across ranks)
+        # Generates samples
+        # Evaluates correctness
+        # Yields one record dictionary
+
+        # Example usage pattern:
+        # records_iter = run_gsm8k_eval(val_task, tokenizer, engine, ...)
+        # for record in records_iter:
+        # Process each record as it arrives
+        # Can break early if needed
+       
+
+
     
 
 
