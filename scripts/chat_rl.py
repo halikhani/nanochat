@@ -202,8 +202,168 @@ def run_gsm8k_eval(task, tokenizer, engine, max_examples=None, num_samples=1, ma
        
 
 
-    
+# -----------------------------------------------------------------------------
+# training loop
 
+# init the optimizer
+optimizers = model.setup_optimizers(
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
+    weight_decay=weight_decay,
+)
 
+# set the initial learning rate as a fraction of the base learning rate
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["lr"] = group["lr"] * init_lr_frac
+        group["initial_lr"] = group["lr"] # saving the init lr to decay easily later
 
+# learning rate scheduler: simple ramp down to zero over num_steps
+def get_lr_multiplier(it):
+    lrm = 1.0 - it / num_steps
+    return lrm
 
+# calculate number of examples each rank handles to achieve the desired examples_per_step
+print0(f"Total sequences per step: {examples_per_step * num_samples}") # total batch size in sequences/step
+assert examples_per_step % ddp_world_size == 0, "Desired examples_per_step must be divisible by the number of ranks"
+examples_per_rank = examples_per_step // ddp_world_size # per gpu
+print0(f"Examples per rank: {examples_per_rank}")
+
+# trainin loop start
+batch_iterator = get_batch()
+for step in range(num_steps):
+    # evaluate the model once in a while and log to wandb
+    if step % eval_every == 0:
+        model.eval()
+        passk = torch.zeros(device_batch_size, device=device) # pass@k for k=1, ..., device_batch_size
+        with autocast_ctx:
+            records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=device_batch_size, max_examples=eval_examples, temperature=1.0)
+            records = list(records_iter)
+        for k in range(1, device_batch_size + 1):
+            passk[k-1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
+        
+        num_records = torch.tensor(len(records), dtype=torch.long, device=device)
+        if ddp:
+            dist.all_reduce(num_records, op=dist.ReduceOp.SUM)
+            dist.all_reduce(passk, op=dist.ReduceOp.SUM)
+            # summing passk for different k values across ranks 
+
+        passk = passk / num_records.item() # normalize by total number of records
+        print_passk = [f"Pass@{k}: {passk[k - 1].item():.4f}" for k in range(1, device_batch_size + 1)]
+        print0(f"Step {step} | {', '.join(print_passk)}")
+        log_passk = {f"pass@{k}": passk[k - 1].item() for k in range(1, device_batch_size + 1)}
+        wandb_run.log({
+            "step": step,
+            **log_passk,
+        })
+
+    # mental example for the next part (training loop):
+    # Let's say we have 2 sequences:
+    # Sequence 1 (reward = 1.0, mean reward = 0.5, advantage = +0.5):
+    # Token 1: logp = -2.3
+    # Token 2: logp = -1.8
+    # Token 3: logp = -2.1
+    # Contribution: (-2.3 - 1.8 - 2.1) * 0.5 = -3.1
+    # Sequence 2 (reward = 0.0, mean reward = 0.5, advantage = -0.5):
+    # Token 1: logp = -2.5
+    # Token 2: logp = -2.0
+    # Token 3: logp = -2.2
+    # Contribution: (-2.5 - 2.0 - 2.2) * (-0.5) = +3.35
+    # Total: -3.1 + 3.35 = +0.25 (positive → increase probability of good sequences, decrease for bad ones)
+
+    # forward/backward on rollouts over multiple examples in the dataset
+    rewards_list = []
+    sequence_lengths = []
+    for example_step in range(examples_per_rank):
+        # get one batch corresponding to one example in the training dataset
+        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        # evaluate the loss and gradients
+        model.train() # ensuring the model is in training mode
+        # We need one more loop because we can never exceed the device_batch_size
+        assert inputs_all.size(0) % device_batch_size == 0
+        num_passes = inputs_all.size(0) // device_batch_size
+        for pass_idx in range(num_passes):
+            # find ranges for this pass in the batch
+            b0, b1 = pass_idx * device_batch_size, (pass_idx + 1) * device_batch_size
+            inputs = inputs_all[b0:b1]
+            targets = targets_all[b0:b1]
+            rewards = rewards_all[b0:b1]
+            advantages = advantages_all[b0:b1]
+            # forward pass
+            # calculate the log probs, note that the loss calculates NLL = -logp, so we negate
+            with autocast_ctx:
+                # if you look back in gpt.py (lines 270-279) 
+                # When reduction="none", F.cross_entropy returns per-token negative log-likelihood (NLL):
+                logp = -model(inputs, targets, loss_reduction="none").view_as(inputs) # (B, T)
+            # calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
+            pg_obj = (logp * advantages.unsqeeuze(-1)).sum()
+            # normalize by number of valid tokens, number of passes, and examples_per_rank
+            num_valid = (targets >= 0).sum().clamp(min=1) 
+            pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
+            # Note, there is no need to add PPO ratio+clip because we are on policy
+            # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
+            loss = -pg_obj
+            loss.backward()
+            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
+        # For logging
+        rewards_list.append(rewards_all.mean().item())
+        sequence_lengths.extend(len(seq) for seq in sequences_all)
+
+    # some loggings for how the rollouts went for this step
+    mean_reward = sum(rewards_list) / len(rewards_list)
+    mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
+    if ddp:
+        mean_reward_tensor = torch.tensor(mean_reward, dtype=torch.float, device=device)
+        mean_sequence_length_tensor = torch.tensor(mean_sequence_length, dtype=torch.float, device=device)
+        dist.all_reduce(mean_reward_tensor, op=dist.ReduceOp.AVG)
+        dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
+        mean_reward = mean_reward_tensor.item()
+        mean_sequence_length = mean_sequence_length_tensor.item()
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+    wandb_run.log({
+        "step": step,
+        "reward": mean_reward,
+        "sequence_length": mean_sequence_length,
+    })
+
+    # updating model params
+    lrm = get_lr_multiplier(step)
+    for opt in optimizers: # first setting the learning rate
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm # restoring the initial lr
+
+    for opt in optimizers: # now step the optimizers
+        opt.step()
+    model.zero_grad() # zeroing the gradients
+    wandb_run.log({
+        "step": step,
+        "lrm": lrm,
+    })
+
+    # master process will save the model once in a while, skipping the first step, and saving the last one as well
+    if master_process and ((step > 0) and (step % save_every == 0 or step == num_steps - 1)):
+        base_dir = get_base_dir()
+        depth = model.config.n_layer
+        output_dirname = model_tag if model_tag else f"d{depth}" # base the model tag on the depth of the base model
+        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
+        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            model.state_dict(),
+            None, # note: we don't bother to save the optimizer state
+            {
+                "model_config": model_config_kwargs,
+            }
+        )
+        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+
+# Log to report
+from nanochat.report import get_report
+get_report().log(section="Chat RL", data=[
+    user_config, # CLI args
+])
+
+wandb_run.finish() # wandb run finish
+compute_cleanup()
