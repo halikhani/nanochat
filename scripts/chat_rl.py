@@ -81,4 +81,75 @@ print0(f"Calculated number of steps: {num_steps}")
 
 @torch.no_grad()
 def get_batch():
+    assistant_end = tokenizer.encode_specia("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
+    rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank for different examples
+    for example_idx in itertools.cycle(rank_indices): # cycle through the examples for each rank indefinitely
+
+        # first get the full conversation of both user and assistant messages
+        conversation = train_task[example_idx]
+
+        # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead
+        # (keeping the |assistant_end| but deleting everything after it)
+        tokens = tokenizer.render_for_completion(conversation)
+        prefix_length = len(tokens)
+
+        # generate num_samples samples using batched generation, using a loop to avoid OOM
+        model.eval()
+        generated_token_sequences = []
+        masks = []
+        num_sampling_steps = num_samples // device_batch_size # to avoid OOM
+        for sampling_step in range(num_sampling_steps):
+            seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
+            with autocast_ctx:
+                generated_tokens_sequences_batch, masks_batch = engine.generate_batch(
+                    tokens,
+                    num_samples=device_batch_size,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    seed=seed, # must make sure to change the seed for each sampling step   
+                )
+            generated_token_sequences.extend(generated_tokens_sequences_batch)
+            masks.extend(masks_batch)
+
+        # calculate the reward for each sample
+        rewards = []
+        for sample_tokens in generated_token_sequences:
+            # only getting the generated tokens after the prompt
+            generated_tokens = sample_tokens[prefix_length:]
+            # decode the generated tokens
+            generated_text = tokenizer.decode(generated_tokens)
+            # calculate the reward
+            reward = train_task.reward(conversation, generated_text)
+            rewards.append(reward)
+
+        # pad the sequences to the same length
+        max_length = max(len(seq) for seq in generated_token_sequences)
+        padded_generated_token_sequences = [ seq + [assistant_end] * (max_length - len(seq)) for seq in generated_token_sequences]
+        padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
+        # stack up into torch tensors
+        ids = torch.tensor(padded_generated_token_sequences, dtype=torch.long, device=device)
+        mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)
+        # generate autoregressive inputs and targets to the transformer
+        inputs = ids[:, :-1]
+        targets = ids[:, 1:].clone() # avoiding modification
+        targets[mask_ids[:, 1:] == 0] = -1 # <-- inplace modification right here. -1 is the ignore index (ignore index when mask is )
+        # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
+        # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
+        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
+        # calculating the advantages by subtracting the mean (instead of the z-score (x-mu)/sigma))
+        mu = rewards.mean()
+        advantages = rewards - mu
+        # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
+        yield generated_token_sequences, inputs, targets, rewards, advantages
+
+    
+# -----------------------------------------------------------------------------
+# Simple evaluation loop for GSM8K pass@k
+def run_gsm8k_eval(task, tokenizer, engine, max_examples=None, num_samples=1, max_completion_tokens=256, temperature=1.0, top_k=50):
     pass
+    
+
+
+
+
