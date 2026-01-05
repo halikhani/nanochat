@@ -276,4 +276,169 @@ async def logo():
 
 
  
+async def generate_stream(
+    worker: Worker,
+    tokens,
+    temperature=None,
+    max_new_tokens=None,
+    top_k=None,
+) -> AsyncGenerator[str, None]:
+    """ Generate assistant response with streaming. """
+    temperature = temperature if temperature is not None else args.temperature
+    max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens
+    top_k = top_k if top_k is not None else args.top_k
+
+    assistant_end = worker.tokenizer.encode_special("|assistant_end|>")
+    bos = worker.tokenizer.get_bos_token_id()
+
+    # accumulate tokens to properly handle multi-byte UTF-8 characters like emojis
+    accumulated_tokens = []
+    # Trac the last completed UTF-8 string (without replacement chars)
+    last_clean_text = ""
+
+    with worker.autocast_ctx:
+        for token_column, token_masks in worker.engine.generate(
+            tokens,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            seed=random.randint(0, 2**31-1),
+        ):
+            token =token_column[0]
+            # token_column[0]: Gets the first (and only) token from the batch
+
+            # stoping criteria:
+            if token == assistant_end or token == bos:
+                break
+
+            # append the token to the sequence
+            accumulated_tokens.append(token)
+            # Decode all accumulated tokens to get proper UTF-8 handling
+            # Note that decode is a quite efficient operation, basically table lookup and string concat
+            current_text = worker.tokenizer.decode(accumulated_tokens)
+            # Only emit text if it doesn't end with a replacement character
+            # This ensures we don't emit incomplete UTF-8 sequences
+            if not current_text.endswith("\uFFFD"): # \uFFFD is the replacement character for incomplete UTF-8 sequences
+                # Extract only the new text since last clean decode
+                new_text = current_text[len(last_clean_text):]
+                if new_text: # only yield if there's new text
+                    yield f"data: {json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
+                    last_clean_text = current_text
+
+
+    yield f"data: {json.dumps({'done': True})}\n\n"
+
+
+@app.post("/chat/completions")
+async def chat_completions(request: ChatRequest):
+    """ Chat completion endpoint (streaming only), uses worker pool for multi-GPU support. """
+    validate_chat_request(request)
+
+    # log incoming conversation to console
+    logger.info("="*20)
+    for i, message in enumerate(request.messages):
+        logger.info(f"[{message.rol.upper()}]: {message.content}")
+    logger.info("="*20)
+
+    # acquire a worker from the pool (will wait if all busy)
+    worker_pool = app.state.worker_pool
+    worker = await worker_pool.acquire_worker()
+
+    try:
+        # build conversation tokens
+        bos = worker.tokenizer.get_bos_token_id()
+        user_start = worker.tokenizer.encode_special("<|user_start|>")
+        user_end = worker.tokenizer.encode_special("<|user_end|>")
+        assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
+        assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
+        
+        conversation_tokens = [bos]
+        for message in request.messages:
+            if message.role == "user":
+                conversation_tokens.append(user_start)
+                conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                conversation_tokens.append(user_end)
+            elif message.role == "assistant":
+                conversation_tokens.append(assistant_start)
+                conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                conversation_tokens.append(assistant_end)
+        
+        conversation_tokens.append(assistant_start)
+
+        # NOTE: async for iterates over an async generator:
+        # Requests the next value from the generator
+        # Waits (non-blocking) if not ready
+        # Executes the loop body with the value
+        # Repeats until the generator is done
+
+        # streaming response with worker, release after completion
+        response_tokens = []
+        async def stream_and_release():
+            try:
+                async for chunk in generate_stream(
+                    worker,
+                    conversation_tokens,
+                    temperature=request.temperature,
+                    max_new_tokens=request.max_tokens,
+                    top_k=request.top_k,
+                ):
+                    # accumulate response for logging
+                    chunk_data = json.loads(chunk.replace("data: ", "").strip())
+                    if 'token' in chunk_data:
+                        response_tokens.append(chunk_data['token'])
+                    yield chunk # for example it will yield first token 'H' from "Hello" in the expected response "Hello, how are you?"
+
+                    # at the end, {'done': True} will be yielded, indicating the end of the stream
+                    # generate_stream() is done, async for loop exits, and the finally block is executed
+            finally:
+                # log the assistant response to console
+                full_response = "".join(response_tokens)
+                logger.info(f"[ASSISTANT] (GPU {worker.gpu_id}): {full_response}")
+                logger.info("="*20)
+                # release the worker back to the pool after streaming is done
+                await worker_pool.release_worker(worker)
+
+        return StreamingResponse(stream_and_release(), media_type="text/event-stream")
+    
+    except Exception as e:
+        # make sure to release the worker back to the pool in case of error as well
+        await worker_pool.release_worker(worker)
+        raise e
+
+
+@app.get("/health")
+async def health():
+    """ Health check endpoint. """
+    worker_pool = getattr(app.state, "worker_pool", None)
+    return {
+        "status": "ok",
+        "ready": worker_pool is not None and len(worker_pool.workers) > 0,
+        "num_gpus": worker_pool.num_gpus if worker_pool is not None else 0,
+        "available_workers": worker_pool.available_workers.qsize() if worker_pool else 0
+    }
+
+
+@app.get("/stats")
+async def stats():
+    """ Get worker pool status."""
+    worker_pool = app.state.worker_pool
+    return {
+        "total_workers": len(worker_pool.workers),
+        "available_workers": worker_pool.available_workers.qsize(),
+        "busy_workers": len(worker_pool.workers) - worker_pool.available_workers.qsize(),
+        "workers": [
+            {
+                "gpu_id": w.gpu_id,
+                "device": str(w.device)
+            } for w in worker_pool.workers
+        ]
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print(f"Starting NanoChat Web Server")
+    print(f"Temperature: {args.temperature}, Top-k: {args.top_k}, Max tokens: {args.max_tokens}")
+    uvicorn.run(app, host=args.host, port=args.port)
 
